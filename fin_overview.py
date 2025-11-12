@@ -1,7 +1,9 @@
+from __future__ import annotations
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.chart import BarChart, Reference
 from datetime import datetime, timedelta
 import sys
 import logging
@@ -93,9 +95,12 @@ def write_to_excel(df, ws, currency, today):
     customer_balances = []
     customer_start_row = row_num
     
+
     for idx, row in df.iterrows():
+        
         # Check if we need to add a subtotal
         if current_customer and current_customer != row['Customer']:
+            
             # Add subtotal if previous customer had 2+ invoices
             invoice_count = len(customer_balances)
             if invoice_count >= 2:
@@ -108,6 +113,12 @@ def write_to_excel(df, ws, currency, today):
                     if col == 8:  # Balance column
                         cell.number_format = f'[{currency}] #,##0.00'
                 row_num += 1
+            
+            # Add an empty row after the grouped Customer
+            ws.append([''] * 8)
+            for col in range (1,9):
+                ws.cell(row=row_num, column=col).border = Border()
+            row_num += 1
             
             customer_balances = []
             customer_start_row = row_num
@@ -173,6 +184,10 @@ def write_to_excel(df, ws, currency, today):
     grand_total = df['Balance'].sum()
     ws.append(['', f"Grand Total Balance: {currency} {grand_total:,.2f}", '', '', '', '', '', grand_total])
     
+    ''' This is summary and barchart, revise if needed'''
+    summary_start = row_num + 2
+    add_customer_balance_chart(ws, df, currency, summary_start)
+    
     # Merge cells for grand total label
     ws.merge_cells(f'B{row_num}:G{row_num}')
     
@@ -188,42 +203,118 @@ def write_to_excel(df, ws, currency, today):
             cell.alignment = Alignment(horizontal='right', vertical='center')
     
     # Adjust column widths
-    column_widths = [8, 30, 15, 15, 12, 12, 12, 12]
+    column_widths = [8, 50, 15, 15, 12, 12, 12, 12]
     for i, width in enumerate(column_widths, 1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
     
     # Freeze header row
     ws.freeze_panes = 'A2'
+    logger.info(f'Worksheet for {currency} completed successfully')
+    
+    
+def add_customer_balance_chart(ws, df, currency, start_row):
+    '''Writes a Customer vs Balance summary and adds a bar chart.
+    start_row: first row to place the summary table.'''
+    
+    # Build summary
+    summary = (
+        df.groupby('Customer', as_index=False)['Balance']
+          .sum()
+          .sort_values('Balance', ascending=False)
+    )
 
-def generate_report(csv_path, output_path='Xero_Awaiting_Payment_Report.xlsx'):
+    # Header
+    ws.cell(row=start_row, column=1, value='Customer').font = Font(bold=True)
+    ws.cell(row=start_row, column=2, value='Balance').font = Font(bold=True)
+
+    r = start_row + 1
+    for _, rec in summary.iterrows():
+        ws.cell(row=r, column=1, value=rec['Customer'])
+        bal_cell = ws.cell(row=r, column=2, value=float(rec['Balance']))
+        bal_cell.number_format = f'[{currency}] #,##0.00'
+        r += 1
+
+    # Create chart
+    chart = BarChart()
+    chart.title = f'Balance by Customer ({currency})'
+    chart.y_axis.title = f'Balance ({currency})'
+    chart.x_axis.title = 'Customer'
+
+    # Data range (y values) and category labels (x values)
+    data_ref = Reference(ws, min_col=2, min_row=start_row, max_row=r-1)   # Balance col including header
+    cats_ref = Reference(ws, min_col=1, min_row=start_row+1, max_row=r-1) # Customers only
+    chart.add_data(data_ref, titles_from_data=True)
+    chart.set_categories(cats_ref)
+
+    # Place the chart (right side of the sheet, adjust anchor as needed)
+    ws.add_chart(chart, 'J2')
+
+
+def generate_report(csv_path, output_path='Financial_Overview_Report.xlsx'):
     """Main function to generate the report"""
     try:
         # Read CSV
         df = pd.read_csv(csv_path)
         
-        # Expected columns (adjust based on your Xero export)
-        required_columns = ['Customer', 'Invoice #', 'Due Date', 'Total', 'Paid', 'Currency']
-        
-        # Check for required columns (case-insensitive)
+        # Map Xero column names to our expected names
         df.columns = df.columns.str.strip()
-        missing_cols = [col for col in required_columns if col not in df.columns]
-        if missing_cols:
-            print(f"Warning: Missing columns: {missing_cols}")
-            print(f"Available columns: {list(df.columns)}")
-            return
+        
+        # Check if this is a Xero export and map columns
+        xero_mapping = {
+            'ContactName': 'Customer',
+            'InvoiceNumber': 'Invoice #',
+            'DueDate': 'Due Date',
+            'Total': 'Total',
+            'InvoiceAmountPaid': 'Paid',
+            'Currency': 'Currency'
+        }
+        
+        # Check if we have Xero columns
+        has_xero_columns = all(col in df.columns for col in xero_mapping.keys())
+        
+        if has_xero_columns:
+            logger.info('Detected Xero CSV format - mapping columns...')
+            df = df.rename(columns=xero_mapping)
+            
+            # Group by invoice number and keep only one row per invoice
+            # (Xero exports have multiple rows per invoice for line items)
+            df = df.groupby('Invoice #').agg({
+                'Customer': 'first',
+                'Due Date': 'first',
+                'Total': 'first',
+                'Paid': 'first',
+                'Currency': 'first'
+            }).reset_index()
+            
+            logger.info(f'Consolidated to {len(df)} unique invoices')
+        else:
+            # Standard column names
+            required_columns = ['Customer', 'Invoice #', 'Due Date', 'Total', 'Paid', 'Currency']
+            missing_cols = [col for col in required_columns if col not in df.columns]
+            if missing_cols:
+                logger.error(f"Missing required columns: {missing_cols}")
+                logger.error(f"Available columns: {list(df.columns)}")
+                print(f"Warning: Missing columns: {missing_cols}")
+                print(f"Available columns: {list(df.columns)}")
+                return
+        
+        logger.info('All required columns found')
         
         # Parse dates
         df['Due Date'] = pd.to_datetime(df['Due Date'], errors='coerce')
+        logger.info('Due dates parsed')
         
         # Convert numeric columns
         df['Total'] = pd.to_numeric(df['Total'], errors='coerce')
         df['Paid'] = pd.to_numeric(df['Paid'], errors='coerce')
+        logger.info('Numeric columns converted')
         
         # Fill NaN values
         df['Paid'] = df['Paid'].fillna(0)
         
         # Today's date
         today = datetime(2025, 11, 11)  # As specified
+        logger.info(f'Reference date set to: {today.strftime("%Y-%m-%d")}')
         
         # Create workbook
         wb = Workbook()
@@ -232,13 +323,13 @@ def generate_report(csv_path, output_path='Xero_Awaiting_Payment_Report.xlsx'):
         # Process USD
         usd_df = process_currency_data(df, 'USD', today)
         if usd_df is not None:
-            ws_usd = wb.create_sheet('USD - Awaiting Payment')
+            ws_usd = wb.create_sheet('USD - Payment')
             write_to_excel(usd_df, ws_usd, 'USD', today)
         
         # Process EUR
         eur_df = process_currency_data(df, 'EUR', today)
         if eur_df is not None:
-            ws_eur = wb.create_sheet('EUR - Awaiting Payment')
+            ws_eur = wb.create_sheet('EUR - Payment')
             write_to_excel(eur_df, ws_eur, 'EUR', today)
         
         # Process other currencies if any
@@ -247,7 +338,7 @@ def generate_report(csv_path, output_path='Xero_Awaiting_Payment_Report.xlsx'):
             for curr in other_currencies:
                 curr_df = process_currency_data(df, curr, today)
                 if curr_df is not None:
-                    ws_other = wb.create_sheet(f'{curr} - Awaiting Payment')
+                    ws_other = wb.create_sheet(f'{curr} - Payment')
                     write_to_excel(curr_df, ws_other, curr, today)
         
         # Save workbook
@@ -264,6 +355,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         csv_file = sys.argv[1]
     else:
-        csv_file = "xero_awaiting_payment.csv"  # Default filename
+        csv_file = "xero.csv"  # Default filename
     
     generate_report(csv_file)
